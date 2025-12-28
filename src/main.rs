@@ -18,10 +18,6 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 
-// ============================================================================
-// DATA STRUCTURES
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PriceFeed {
     id: String,
@@ -91,23 +87,14 @@ enum ServerMessage {
 
 type UserId = String;
 
-// Application state
 struct AppState {
     feed_registry: HashMap<String, PriceFeed>,
     symbol_to_id: HashMap<String, String>,
     top_100_feeds: Vec<String>,
-
-    // User Management
     user_watchlists: HashMap<UserId, HashSet<String>>,
     clients: HashMap<UserId, mpsc::UnboundedSender<Message>>,
-
-    // Global Watchlist (Union of all user watchlists + Top 100)
     watched_feeds: HashSet<String>,
-
-    // Data Store
     live_prices: HashMap<String, ParsedPrice>,
-
-    // Stream Management
     currently_streaming: HashSet<String>,
     stream_handle: Option<JoinHandle<()>>,
 }
@@ -129,11 +116,9 @@ impl AppState {
                 println!("   - User watched: {}", state.watched_feeds.len());
             }
 
-            // Spawn the actual stream loop
             let stream_state = state_arc.clone();
             let handle = tokio::spawn(async move {
                 loop {
-                    // We need to re-read the active feeds in case they changed before restart
                     let current_feeds = {
                         let s = stream_state.read().await;
                         s.get_active_feeds()
@@ -161,8 +146,6 @@ impl AppState {
             if let Some(handle) = state.stream_handle.take() {
                 handle.abort();
             }
-            // Release lock before calling start_streaming to avoid deadlock potential
-            // (though start_streaming is async/spawned, it's safer)
             drop(state);
 
             AppState::start_streaming(state_arc.clone());
@@ -183,7 +166,6 @@ impl AppState {
     fn remove_client(&mut self, user_id: &UserId) {
         self.clients.remove(user_id);
         if let Some(watchlist) = self.user_watchlists.remove(user_id) {
-            // Cleanup global watched_feeds
             for feed_id in watchlist {
                 self.check_and_remove_global_watch(&feed_id);
             }
@@ -199,7 +181,6 @@ impl AppState {
     }
 
     fn add_subscription(&mut self, user_id: &UserId, symbol: &str) -> Option<String> {
-        // Strip "Crypto." if user provides it, or ensure we match how we stored it
         let lookup_symbol = symbol.trim_start_matches("Crypto.");
 
         if let Some(feed_id) = self.symbol_to_id.get(lookup_symbol).cloned() {
@@ -211,7 +192,7 @@ impl AppState {
             let was_new = self.watched_feeds.insert(feed_id.clone());
 
             if was_new && !self.top_100_feeds.contains(&feed_id) {
-                return Some(feed_id); // Return ID to signal restart needed
+                return Some(feed_id);
             }
         }
         None
@@ -229,17 +210,13 @@ impl AppState {
             if !still_watched {
                 self.watched_feeds.remove(&feed_id);
                 if !self.top_100_feeds.contains(&feed_id) {
-                    return Some(feed_id); // Signal restart needed
+                    return Some(feed_id);
                 }
             }
         }
         None
     }
 }
-
-// ============================================================================
-// WEBSOCKET HANDLER
-// ============================================================================
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -259,13 +236,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<RwLock<AppState>>, user_id:
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    // Register client
     {
         let mut s = state.write().await;
         s.add_client(user_id.clone(), tx);
     }
 
-    // Task to send messages from channel to websocket
     let mut send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sender.send(msg).await.is_err() {
@@ -274,7 +249,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<RwLock<AppState>>, user_id:
         }
     });
 
-    // Task to receive messages from websocket
     let state_clone = state.clone();
     let uid = user_id.clone();
     let mut recv_task = tokio::spawn(async move {
@@ -303,11 +277,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<RwLock<AppState>>, user_id:
                                     response_msg = Some(format!("Unsubscribed from {}", symbol));
                                 }
                             }
-                        } // Release lock
+                        }
 
-                        if let Some(msg) = response_msg {
-                            // Optional: send ack
-                            // send_info(&state_clone, &uid, &msg).await;
+                        if let Some(_msg) = response_msg {
+                            // Optional ack
                         }
 
                         if restart_needed {
@@ -322,27 +295,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<RwLock<AppState>>, user_id:
         }
     });
 
-    // Wait for either task to finish (disconnect)
     tokio::select! {
         _ = (&mut send_task) => {},
         _ = (&mut recv_task) => {},
     };
 
-    // Cleanup
     {
         let mut s = state.write().await;
         s.remove_client(&user_id);
     }
-
-    // Check if we need to restart stream (if they were the last watcher of something)
-    // Note: We'd need to track what they removed specifically, but remove_client handles global cleanup.
-    // Optimization: check if active feeds changed vs currently streaming.
-    // For now, we'll let the next add/remove trigger it or lazily update.
 }
-
-// ============================================================================
-// STREAM LOGIC
-// ============================================================================
 
 async fn stream_multiple_feeds(
     feed_ids: Vec<String>,
@@ -396,8 +358,6 @@ async fn process_sse_message(message: &str, state_arc: &Arc<RwLock<AppState>>) {
         if line.starts_with("data:") {
             let data = line[5..].trim();
             if let Ok(update) = serde_json::from_str::<PriceUpdate>(data) {
-                // We lock for WRITING to update prices and broadcasting
-                // Note: In high freq, we might want to split this, but for now it ensures consistency
                 let mut state = state_arc.write().await;
 
                 for price_data in update.parsed {
@@ -405,7 +365,6 @@ async fn process_sse_message(message: &str, state_arc: &Arc<RwLock<AppState>>) {
                         .live_prices
                         .insert(price_data.id.clone(), price_data.clone());
 
-                    // Broadcast to subscribers
                     broadcast_update(&mut state, &price_data).await;
                 }
             }
@@ -414,14 +373,6 @@ async fn process_sse_message(message: &str, state_arc: &Arc<RwLock<AppState>>) {
 }
 
 async fn broadcast_update(state: &mut AppState, price: &ParsedPrice) {
-    // 1. Find the symbol for this feed ID
-    // We need to reverse lookup or store it in price.
-    // Luckily price feed registry has it.
-
-    // Optimization: Create a FeedID -> [UserId] map in AppState to avoid iterating all users.
-    // For now, iterating 100 users is fine.
-
-    // Find users watching this feed_id
     let mut users_to_notify = Vec::new();
 
     for (user_id, watchlist) in &state.user_watchlists {
@@ -434,8 +385,7 @@ async fn broadcast_update(state: &mut AppState, price: &ParsedPrice) {
         return;
     }
 
-    // Prepare message
-    let feed = state.feed_registry.get(&price.id).unwrap(); // Should exist
+    let feed = state.feed_registry.get(&price.id).unwrap();
     let val = price.price.price.parse::<f64>().unwrap_or(0.0) * 10f64.powi(price.price.expo);
     let conf = price.price.conf.parse::<f64>().unwrap_or(0.0) * 10f64.powi(price.price.expo);
 
@@ -448,17 +398,12 @@ async fn broadcast_update(state: &mut AppState, price: &ParsedPrice) {
 
     let json = serde_json::to_string(&msg).unwrap();
 
-    // Send
     for uid in users_to_notify {
         if let Some(tx) = state.clients.get_mut(&uid) {
             let _ = tx.send(Message::Text(json.clone().into()));
         }
     }
 }
-
-// ============================================================================
-// INITIALIZATION & MAIN
-// ============================================================================
 
 async fn fetch_all_price_feeds(
     asset_type: Option<&str>,
@@ -559,18 +504,14 @@ async fn initialize_app_state() -> Result<AppState, Box<dyn Error + Send + Sync>
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // 1. Initialize State
     let state = Arc::new(RwLock::new(initialize_app_state().await?));
 
-    // 2. Start initial stream
     AppState::start_streaming(state.clone());
 
-    // 3. Setup Router
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .with_state(state);
 
-    // 4. Run Server
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("🚀 WebSocket Server running on ws://{}", addr);
 
