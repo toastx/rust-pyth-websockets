@@ -425,6 +425,8 @@ async fn fetch_all_price_feeds(
     Ok(feeds)
 }
 
+const MAX_DEFAULT_FEEDS: usize = 100;
+
 fn select_top_100(feeds: &[PriceFeed]) -> Vec<String> {
     let priority_symbols = [
         "BTC/USD",
@@ -452,23 +454,36 @@ fn select_top_100(feeds: &[PriceFeed]) -> Vec<String> {
         "BONK/USD",
         "FLOKI/USD",
     ];
-    let mut selected = Vec::new();
+
+    // Build a HashMap for O(1) symbol lookups instead of O(n) nested loops
+    let symbol_to_feed: HashMap<&str, &PriceFeed> = feeds
+        .iter()
+        .map(|f| (f.attributes.symbol.as_str(), f))
+        .collect();
+
+    let mut selected = Vec::with_capacity(MAX_DEFAULT_FEEDS);
+    let mut selected_ids: HashSet<&str> = HashSet::new();
+
+    // First, add priority symbols using O(1) lookups
     for symbol in priority_symbols {
-        for feed in feeds {
-            if feed.attributes.symbol == format!("Crypto.{}", symbol) {
-                selected.push(feed.id.clone());
-                break;
-            }
-        }
-    }
-    for feed in feeds {
-        if feed.attributes.asset_type == "Crypto" && !selected.contains(&feed.id) {
+        let crypto_symbol = format!("Crypto.{}", symbol);
+        if let Some(feed) = symbol_to_feed.get(crypto_symbol.as_str()) {
             selected.push(feed.id.clone());
-            if selected.len() >= 100 {
-                break;
-            }
+            selected_ids.insert(&feed.id);
         }
     }
+
+    // Fill remaining slots with other crypto feeds
+    for feed in feeds {
+        if selected.len() >= MAX_DEFAULT_FEEDS {
+            break;
+        }
+        if feed.attributes.asset_type == "Crypto" && !selected_ids.contains(feed.id.as_str()) {
+            selected.push(feed.id.clone());
+            selected_ids.insert(&feed.id);
+        }
+    }
+
     selected
 }
 
@@ -510,13 +525,41 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("🚀 WebSocket Server running on ws://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // Graceful shutdown handling
+    let shutdown_state = state.clone();
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                eprintln!("❌ Server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n🛑 Received shutdown signal, cleaning up...");
+            
+            // Abort the streaming task
+            let mut s = shutdown_state.write().await;
+            if let Some(handle) = s.stream_handle.take() {
+                handle.abort();
+                println!("   ✓ Stream task aborted");
+            }
+            
+            // Notify connected clients
+            let client_count = s.clients.len();
+            for (_, tx) in s.clients.drain() {
+                let _ = tx.send(axum::extract::ws::Message::Close(None));
+            }
+            println!("   ✓ Notified {} clients of shutdown", client_count);
+            
+            println!("👋 Goodbye!");
+        }
+    }
 
     Ok(())
 }

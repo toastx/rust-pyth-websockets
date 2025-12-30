@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "opencode-antigravity-auth": "^1.2.7-beta.3",
     "ws": "^8.18.3"
   }
 }
